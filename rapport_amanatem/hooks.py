@@ -1,0 +1,6 @@
+app_name = "rapport_amanatem"
+app_title = "Rapport Amanatem"
+app_publisher = "Amanatem"
+app_description = "Rapports de stock - Amanatem"
+app_email = "me@gmail.com"
+app_license = "mit"
