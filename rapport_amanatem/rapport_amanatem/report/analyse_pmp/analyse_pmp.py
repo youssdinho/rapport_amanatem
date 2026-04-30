@@ -3,12 +3,12 @@ Rapport Analyse PMP - Amanatem
 ==============================
 Compare le PMP calculé par ERPNext avec notre propre calcul du PMP.
 
-Méthode de calcul du PMP :
-- Stock initial  : dernier état connu AVANT la date de début (qty_after_transaction + valuation_rate ERPNext)
-- Entrée achat   : nouveau PMP = (valeur_courante + qté * prix_HT_document) / (qté_courante + qté)
-- Retour client  : le prix utilisé = PMP courant à cette date (stock revient au même coût)
-- Sortie (vente) : valeur réduite au PMP courant, PMP inchangé
-- Retour fournisseur : sortie de stock, PMP inchangé
+Méthode de calcul : FIFO (identique à ERPNext)
+- Stock initial       : file FIFO (stock_queue) du dernier SLE AVANT la date de début
+- Entrée achat        : ajout d'une couche [qty, prix_HT] en fin de file
+- Retour client       : ajout d'une couche [qty, pmp_courant] en fin de file
+- Sortie / retour fo  : consommation des couches les plus anciennes (FIFO)
+- PMP affiché         : moyenne pondérée des couches restantes
 
 Sources de prix HT (depuis les documents) :
   Purchase Receipt  → tabPurchase Receipt Item.net_rate
@@ -17,16 +17,14 @@ Sources de prix HT (depuis les documents) :
 
 Tous les prix affichés sont HT.
 """
+import json
 import frappe
 from frappe import _
 from frappe.utils import getdate
 
 
-# Doctypes pouvant avoir le flag is_return
 IS_RETURN_DOCTYPES = {"Sales Invoice", "Delivery Note", "Purchase Receipt", "Purchase Invoice"}
 
-# Mapping voucher_type → (table_enfant, champ_prix_ht)
-# utilisé pour récupérer le prix HT depuis le document source via voucher_detail_no
 PRIX_DETAIL_MAP = {
 	"Purchase Receipt": ("tabPurchase Receipt Item", "net_rate"),
 	"Purchase Invoice": ("tabPurchase Invoice Item", "net_rate"),
@@ -95,23 +93,48 @@ def get_columns():
 
 
 # ---------------------------------------------------------------------------
+# Helpers FIFO
+# ---------------------------------------------------------------------------
+
+def queue_pmp(queue):
+	"""Moyenne pondérée des couches FIFO restantes."""
+	total_qty = sum(layer[0] for layer in queue)
+	if total_qty <= 0:
+		return 0.0
+	return sum(layer[0] * layer[1] for layer in queue) / total_qty
+
+
+def fifo_consume(queue, qty_to_consume):
+	"""Consomme qty_to_consume depuis le début de la file FIFO."""
+	remaining = qty_to_consume
+	new_queue = []
+	for layer_qty, layer_rate in queue:
+		if remaining <= 0:
+			new_queue.append([layer_qty, layer_rate])
+		elif remaining >= layer_qty:
+			remaining -= layer_qty
+		else:
+			new_queue.append([layer_qty - remaining, layer_rate])
+			remaining = 0.0
+	return new_queue
+
+
+# ---------------------------------------------------------------------------
 # Données de base
 # ---------------------------------------------------------------------------
 
 def get_opening_state(date_debut):
 	"""
-	Retourne pour chaque article le dernier état connu AVANT date_debut :
-	  - qty  : qty_after_transaction du dernier SLE
-	  - pmp  : valuation_rate du dernier SLE
-	  - value: qty * pmp
-	Cela constitue le point de départ de notre calcul de PMP.
+	Retourne la file FIFO (stock_queue) du dernier SLE AVANT date_debut.
+	Si stock_queue est vide mais qu'il y a du stock, crée une couche unique.
 	"""
 	rows = frappe.db.sql(
 		"""
 		SELECT
 			sle.item_code,
 			sle.qty_after_transaction AS qty,
-			sle.valuation_rate        AS pmp
+			sle.valuation_rate        AS pmp,
+			sle.stock_queue
 		FROM `tabStock Ledger Entry` sle
 		INNER JOIN (
 			SELECT item_code, MAX(posting_datetime) AS max_dt
@@ -134,11 +157,13 @@ def get_opening_state(date_debut):
 	for r in rows:
 		qty = r.qty or 0.0
 		pmp = r.pmp or 0.0
-		opening[r.item_code] = {
-			"qty":   qty,
-			"pmp":   pmp,
-			"value": qty * pmp,
-		}
+		try:
+			queue = json.loads(r.stock_queue or "[]")
+		except (ValueError, TypeError):
+			queue = []
+		if not queue and qty > 0 and pmp > 0:
+			queue = [[qty, pmp]]
+		opening[r.item_code] = {"queue": queue}
 	return opening
 
 
@@ -169,11 +194,6 @@ def get_mouvements(date_debut, date_fin):
 
 
 def get_is_return_map(mouvements):
-	"""
-	Pour les entrées en stock (actual_qty > 0) dont le doctype peut avoir is_return,
-	vérifie si le document source est un retour.
-	Retourne : dict { (voucher_type, voucher_no) -> bool }
-	"""
 	by_type = {}
 	for m in mouvements:
 		if m.actual_qty > 0 and m.voucher_type in IS_RETURN_DOCTYPES:
@@ -197,17 +217,12 @@ def get_is_return_map(mouvements):
 
 
 def get_prix_achat_map(mouvements, is_return_map):
-	"""
-	Pour les entrées achats (non-retour), récupère le prix HT depuis
-	la ligne du document source identifiée par voucher_detail_no.
-	Retourne : dict { voucher_detail_no -> prix_ht }
-	"""
 	by_type = {}
 	for m in mouvements:
 		if m.actual_qty <= 0:
 			continue
 		if is_return_map.get((m.voucher_type, m.voucher_no), False):
-			continue  # retour → prix = PMP courant, pas besoin du document
+			continue
 		if m.voucher_type not in PRIX_DETAIL_MAP:
 			continue
 		if not m.voucher_detail_no:
@@ -233,7 +248,6 @@ def get_prix_achat_map(mouvements, is_return_map):
 
 
 def get_bin_data():
-	"""Quantité et PMP actuels par article depuis tabBin (source ERPNext)."""
 	rows = frappe.db.sql(
 		"""
 		SELECT
@@ -252,63 +266,45 @@ def get_bin_data():
 
 
 # ---------------------------------------------------------------------------
-# Calcul du PMP
+# Calcul du PMP en FIFO
 # ---------------------------------------------------------------------------
 
 def calculate_pmp(opening, mouvements, is_return_map, prix_map):
 	"""
-	Calcule notre PMP pour chaque article en traitant les mouvements
-	chronologiquement.
+	Calcule le PMP FIFO pour chaque article en traitant les mouvements
+	chronologiquement, identique à la méthode ERPNext.
 
-	Règles :
-	  - Entrée achat    : PMP = (valeur + qté * prix_HT) / (stock + qté)
-	  - Retour client   : entrée valorisée au PMP courant → PMP inchangé
-	  - Sortie vente    : valeur -= qté_sortie * PMP courant → PMP inchangé
-	  - Retour fournisseur : sortie → PMP inchangé
+	- Entrée achat      : ajoute [qty, prix_HT] en fin de file
+	- Retour client     : ajoute [qty, pmp_courant] en fin de file
+	- Sortie / retour fo: consomme les couches les plus anciennes (FIFO)
 	"""
-	state = {
-		code: {"qty": o["qty"], "value": o["value"], "pmp": o["pmp"]}
-		for code, o in opening.items()
-	}
+	state = {code: {"queue": list(o["queue"])} for code, o in opening.items()}
 
 	for m in mouvements:
 		code = m.item_code
 		if code not in state:
-			state[code] = {"qty": 0.0, "value": 0.0, "pmp": 0.0}
+			state[code] = {"queue": []}
 
 		s = state[code]
-		qty = m.actual_qty  # positif = entrée, négatif = sortie
+		qty = m.actual_qty
 
 		if qty > 0:
-			# --- Entrée en stock ---
 			key = (m.voucher_type, m.voucher_no)
 			if is_return_map.get(key, False):
-				# Retour client : valorisé au PMP courant (pas de changement de PMP)
-				rate = s["pmp"]
+				# Retour client : valorisé au PMP courant de la file
+				rate = queue_pmp(s["queue"])
 			else:
-				# Achat : prix HT depuis le document
+				# Achat : prix HT depuis le document source
 				rate = prix_map.get(m.voucher_detail_no or "", 0.0)
 				if not rate:
-					# Fallback sur incoming_rate ERPNext si prix document absent
 					rate = m.incoming_rate or 0.0
-
-			new_qty   = s["qty"] + qty
-			new_value = s["value"] + qty * rate
-			s["qty"]   = new_qty
-			s["value"] = new_value
-			s["pmp"]   = new_value / new_qty if new_qty > 0 else s["pmp"]
+			s["queue"].append([qty, rate])
 
 		elif qty < 0:
-			# --- Sortie de stock ---
-			# Réduire la valeur au PMP courant ; le PMP ne change pas
-			s["value"] = s["value"] + qty * s["pmp"]  # qty est négatif
-			s["qty"]   = s["qty"]   + qty
-			if s["qty"] <= 0:
-				s["qty"]   = 0.0
-				s["value"] = 0.0
-				# On conserve le pmp en mémoire même à stock zéro
+			# Sortie : consommation FIFO depuis le début de la file
+			s["queue"] = fifo_consume(s["queue"], abs(qty))
 
-	return state
+	return {code: {"pmp": queue_pmp(s["queue"])} for code, s in state.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -319,25 +315,13 @@ def get_data(filters):
 	date_debut = filters["date_debut"]
 	date_fin   = filters["date_fin"]
 
-	# 1. État initial (dernier SLE avant date_debut)
-	opening = get_opening_state(date_debut)
-
-	# 2. Mouvements dans la période
-	mouvements = get_mouvements(date_debut, date_fin)
-
-	# 3. Identifier les retours parmi les entrées
+	opening       = get_opening_state(date_debut)
+	mouvements    = get_mouvements(date_debut, date_fin)
 	is_return_map = get_is_return_map(mouvements)
+	prix_map      = get_prix_achat_map(mouvements, is_return_map)
+	pmp_state     = calculate_pmp(opening, mouvements, is_return_map, prix_map)
+	bin_data      = get_bin_data()
 
-	# 4. Prix HT depuis les documents sources (achats uniquement)
-	prix_map = get_prix_achat_map(mouvements, is_return_map)
-
-	# 5. Calcul de notre PMP
-	pmp_state = calculate_pmp(opening, mouvements, is_return_map, prix_map)
-
-	# 6. Stock et PMP ERPNext depuis tabBin (articles avec stock > 0)
-	bin_data = get_bin_data()
-
-	# 7. Noms des articles
 	item_name_map = {
 		r.name: r.item_name
 		for r in frappe.db.sql(
@@ -346,7 +330,6 @@ def get_data(filters):
 		)
 	}
 
-	# 8. Construction des lignes (uniquement articles avec stock ERPNext > 0)
 	rows = []
 	for item_code, b in bin_data.items():
 		qty_stock   = b.qty or 0.0

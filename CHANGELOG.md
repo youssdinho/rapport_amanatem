@@ -5,6 +5,20 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
 ---
 
+## [0.2.0] - 2026-04-30
+
+### Modifié
+- **Rapport Analyse PMP** : refonte complète de la méthode de calcul du PMP.
+  - Passage de Moving Average (PMP glissant) à **FIFO**, identique à la méthode ERPNext.
+  - Stock initial basé sur le champ `stock_queue` du dernier SLE avant la date de début (file FIFO réelle).
+  - Entrées achat : ajout d'une couche `[qty, prix_HT]` en fin de file.
+  - Retours clients : ajout d'une couche au PMP courant de la file.
+  - Sorties : consommation des couches les plus anciennes en premier (FIFO).
+  - PMP calculé = moyenne pondérée des couches restantes.
+  - Seuil d'affichage de l'écart relevé de 0.001 à **0.01** pour filtrer le bruit d'arrondi monétaire ERPNext.
+
+---
+
 ## [0.1.0] - 2026-03-27
 
 ### Ajouté

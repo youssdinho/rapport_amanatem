@@ -21,7 +21,7 @@ frappe.query_reports["Analyse PMP"] = {
 		value = default_formatter(value, row, column, data);
 		if (column.fieldname === "ecart" && data) {
 			const ecart = parseFloat(data.ecart) || 0;
-			if (Math.abs(ecart) < 0.001) {
+			if (Math.abs(ecart) < 0.01) {
 				value = `<span style="color: green; font-weight: bold;">${value}</span>`;
 			} else {
 				value = `<span style="color: red; font-weight: bold;">${value}</span>`;
